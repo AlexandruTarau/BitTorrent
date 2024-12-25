@@ -10,18 +10,21 @@
 #define HASH_SIZE 32
 #define MAX_CHUNKS 100
 
+// Struct for a file
 typedef struct {
     char file_name[MAX_FILENAME + 1];
     int number_of_chunks;
     char chunks[MAX_CHUNKS][HASH_SIZE + 1];
 } file;
 
+// Struct for a file list from the tracker
 typedef struct {
     file f;
     int swarm_size;
-    int swarm[100];  // Do dynamic allocation later
+    int swarm[100];
 } tracker_file_list;
 
+// Struct for the download thread arguments
 typedef struct {
     int* rank;
     int* number_of_wanted_files;
@@ -30,12 +33,39 @@ typedef struct {
     int* number_of_owned_files;
 } download_thread_arg;
 
+// Struct for the upload thread arguments
 typedef struct {
-    int* rank;
     int* stop;
     file* owned_files;
     int* number_of_owned_files;
 } upload_thread_arg;
+
+// Sort the swarm by upload number
+void sort_swarm(int file_index, tracker_file_list* files_list)
+{
+    int upload_numbers[files_list[file_index].swarm_size];
+
+    // Request upload numbers from all peers
+    for (int j = 0; j < files_list[file_index].swarm_size; j++) {
+        MPI_Send(NULL, 0, MPI_CHAR, files_list[file_index].swarm[j], 8, MPI_COMM_WORLD);
+        MPI_Recv(&upload_numbers[j], 1, MPI_INT, files_list[file_index].swarm[j], 9, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    }
+
+    // Sort the swarm by upload number of each peer
+    for (int j = 0; j < files_list[file_index].swarm_size - 1; j++) {
+        for (int k = j + 1; k < files_list[file_index].swarm_size; k++) {
+            if (upload_numbers[j] > upload_numbers[k]) {
+                int aux = upload_numbers[j];
+                upload_numbers[j] = upload_numbers[k];
+                upload_numbers[k] = aux;
+
+                int aux2 = files_list[file_index].swarm[j];
+                files_list[file_index].swarm[j] = files_list[file_index].swarm[k];
+                files_list[file_index].swarm[k] = aux2;
+            }
+        }
+    }
+}
 
 void *download_thread_func(void *arg)
 {
@@ -80,9 +110,11 @@ void *download_thread_func(void *arg)
         int provider_index = 0;
         int count = 0;
 
+        // Download chunks
         for (int j = 0; j < wanted_files_list[i].f.number_of_chunks; j++) {
             int found = 0;
             char chunk[HASH_SIZE + 1];
+            provider_index = 0;
 
             // Update the swarm every 10 chunks
             if (count == 10) {
@@ -92,22 +124,20 @@ void *download_thread_func(void *arg)
                 int tag = 2;
                 MPI_Send(&tag, 1, MPI_INT, TRACKER_RANK, 0, MPI_COMM_WORLD);
 
-                // Send the list of wanted files
-                MPI_Send(&number_of_wanted_files, 1, MPI_INT, TRACKER_RANK, 2, MPI_COMM_WORLD);
+                // Send the file name to the tracker
+                MPI_Send(wanted_files_list[i].f.file_name, MAX_FILENAME + 1, MPI_CHAR, TRACKER_RANK, 2, MPI_COMM_WORLD);
 
-                for (int i = 0; i < number_of_wanted_files; i++) {
-                    MPI_Send(wanted_files_list[i].f.file_name, MAX_FILENAME + 1, MPI_CHAR, TRACKER_RANK, 2, MPI_COMM_WORLD);
+                // Receive the updated swarm
+                MPI_Recv(&wanted_files_list[i].swarm_size, 1, MPI_INT, TRACKER_RANK, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-                    MPI_Recv(&wanted_files_list[i].swarm_size, 1, MPI_INT, TRACKER_RANK, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-
-                    for (int j = 0; j < wanted_files_list[i].swarm_size; j++) {
-                        MPI_Recv(&wanted_files_list[i].swarm[j], 1, MPI_INT, TRACKER_RANK, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                    }
+                for (int j = 0; j < wanted_files_list[i].swarm_size; j++) {
+                    MPI_Recv(&wanted_files_list[i].swarm[j], 1, MPI_INT, TRACKER_RANK, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
                 }
             }
 
             strcpy(chunk, wanted_files_list[i].f.chunks[j]);
 
+            // Check if the chunk is already owned
             for (int k = 0; k < owned_files[(*number_of_owned_files) - 1].number_of_chunks; k++) {
                 if (strcmp(owned_files[(*number_of_owned_files) - 1].chunks[k], chunk) == 0) {
                     found = 1;
@@ -119,26 +149,41 @@ void *download_thread_func(void *arg)
             if (!found) {
                 if (wanted_files_list[i].swarm_size == 0) {
                     continue;
-                } else if (wanted_files_list[i].swarm[provider_index] != rank) {
+                } else {
                     int try_again = 1;
                 
+                    // Download the chunk from the peers in the swarm
                     while (try_again) {
                         try_again = 0;
 
-                        // Send a request to the peer
-                        MPI_Send(chunk, HASH_SIZE + 1, MPI_CHAR, wanted_files_list[i].swarm[provider_index], 6, MPI_COMM_WORLD);
-                        
-                        // Receive ACK and add the chunk to the owned_files list
-                        char ack[4];
-                        MPI_Status status;
-                        MPI_Recv(ack, 4, MPI_CHAR, wanted_files_list[i].swarm[provider_index], 7, MPI_COMM_WORLD, &status);
+                        if (wanted_files_list[i].swarm[provider_index] != rank) {
+                            // Send a request to the peer
+                            MPI_Send(chunk, HASH_SIZE + 1, MPI_CHAR, wanted_files_list[i].swarm[provider_index], 6, MPI_COMM_WORLD);
+                            
+                            // Receive ACK and add the chunk to the owned_files list
+                            char ack[4];
+                            MPI_Status status;
+                            MPI_Recv(ack, 4, MPI_CHAR, wanted_files_list[i].swarm[provider_index], 7, MPI_COMM_WORLD, &status);
 
-                        if (strcmp(ack, "ACK") == 0) {
-                            count++;
-                            strcpy(owned_files[(*number_of_owned_files) - 1].chunks[owned_files[(*number_of_owned_files) - 1].number_of_chunks++], chunk);
+                            if (strcmp(ack, "ACK") == 0) {
+                                count++;
+                                strcpy(owned_files[(*number_of_owned_files) - 1].chunks[owned_files[(*number_of_owned_files) - 1].number_of_chunks++], chunk);
+                            } else {
+                                // If the peer doesn't have the chunk, try the next one
+                                try_again = 1;
+                                provider_index = (provider_index + 1) % wanted_files_list[i].swarm_size;
+                            }
                         } else {
+                            // If the peer is the current peer, try the next one
                             try_again = 1;
                             provider_index = (provider_index + 1) % wanted_files_list[i].swarm_size;
+                        }
+
+                        // If we tried all peers, force an update of the swarm
+                        if (try_again && provider_index == 0) {
+                            count = 10;
+                            j--;
+                            break;
                         }
                     }
                 }
@@ -153,6 +198,7 @@ void *download_thread_func(void *arg)
         FILE *out;
         char out_filename[50];
         sprintf(out_filename, "client%d_%s", rank, wanted_files_list[i].f.file_name);
+
         out = fopen(out_filename, "w");
         if (out == NULL) {
             printf("Eroare la deschiderea fisierului de iesire\n");
@@ -177,20 +223,32 @@ void *download_thread_func(void *arg)
 void *upload_thread_func(void *arg)
 {
     upload_thread_arg* thread_arg = (upload_thread_arg*) arg;
-    //int rank = *(thread_arg->rank);
     int* stop = thread_arg->stop;
     file* owned_files = thread_arg->owned_files;
     int* number_of_owned_files = thread_arg->number_of_owned_files;
+    int number_of_uploads = 0;
     char chunk[HASH_SIZE + 1];
-    MPI_Status status;
-    MPI_Request request;
+    MPI_Status chunk_status;
+    MPI_Status upload_number_status;
+    MPI_Request chunk_request;
+    MPI_Request upload_number_request;
 
     // Receive chunk request
-    MPI_Irecv(chunk, HASH_SIZE + 1, MPI_CHAR, MPI_ANY_SOURCE, 6, MPI_COMM_WORLD, &request);
+    MPI_Irecv(chunk, HASH_SIZE + 1, MPI_CHAR, MPI_ANY_SOURCE, 6, MPI_COMM_WORLD, &chunk_request);
+
+    // Receive number of uploads request
+    MPI_Irecv(NULL, 0, MPI_CHAR, MPI_ANY_SOURCE, 8, MPI_COMM_WORLD, &upload_number_request);
 
     while ((*stop) == 0) {
         int flag = 0;
-        MPI_Test(&request, &flag, &status);
+        MPI_Test(&upload_number_request, &flag, &upload_number_status);
+
+        if (flag) {
+            MPI_Send(&number_of_uploads, 1, MPI_INT, upload_number_status.MPI_SOURCE, 9, MPI_COMM_WORLD);
+            MPI_Irecv(NULL, 0, MPI_CHAR, MPI_ANY_SOURCE, 8, MPI_COMM_WORLD, &upload_number_request);
+        }
+
+        MPI_Test(&chunk_request, &flag, &chunk_status);
 
         if (!flag) {
             continue;
@@ -209,15 +267,16 @@ void *upload_thread_func(void *arg)
 
         // If the chunk is found, send it to the peer
         if (found) {
+            number_of_uploads++;
             char ack[4] = "ACK";
-            MPI_Send(ack, 4, MPI_CHAR, status.MPI_SOURCE, 7, MPI_COMM_WORLD);
+            MPI_Send(ack, 4, MPI_CHAR, chunk_status.MPI_SOURCE, 7, MPI_COMM_WORLD);
         } else {
             char nack[4] = "NCK";
-            MPI_Send(nack, 4, MPI_CHAR, status.MPI_SOURCE, 7, MPI_COMM_WORLD);
+            MPI_Send(nack, 4, MPI_CHAR, chunk_status.MPI_SOURCE, 7, MPI_COMM_WORLD);
         }
 
         // Receive the next chunk request
-        MPI_Irecv(chunk, HASH_SIZE + 1, MPI_CHAR, MPI_ANY_SOURCE, 6, MPI_COMM_WORLD, &request);
+        MPI_Irecv(chunk, HASH_SIZE + 1, MPI_CHAR, MPI_ANY_SOURCE, 6, MPI_COMM_WORLD, &chunk_request);
     }
 
     return NULL;
@@ -240,6 +299,8 @@ void tracker(int numtasks, int rank) {
             char file_name[MAX_FILENAME + 1];
             int number_of_chunks;
             char chunks[MAX_CHUNKS][HASH_SIZE + 1];
+
+            // Receive file data
             MPI_Recv(file_name, MAX_FILENAME + 1, MPI_CHAR, status.MPI_SOURCE, 0, MPI_COMM_WORLD, &status);
             MPI_Recv(&number_of_chunks, 1, MPI_INT, status.MPI_SOURCE, 0, MPI_COMM_WORLD, &status);
 
@@ -264,16 +325,16 @@ void tracker(int numtasks, int rank) {
                 for (int j = 0; j < number_of_chunks; j++) {
                     strcpy(files_list[file_index].f.chunks[j], chunks[j]);
                 }
+                files_list[file_index].swarm_size = 0;
             }
 
             // Add seeder to the swarm
             files_list[file_index].swarm[files_list[file_index].swarm_size++] = status.MPI_SOURCE;
-
-            number_of_clients++;
         }
+        number_of_clients++;
     }
 
-    // Send an "ACK" to all clients
+    // Send an "ACK" to all clients to signal they can start downloading/uploading
     {
         char ack[4] = "ACK";
         for (int i = 0; i < numtasks; i++) {
@@ -285,7 +346,7 @@ void tracker(int numtasks, int rank) {
 
     // Receive requests from peers
     while (1) {
-        int tag;
+        int tag;  // 1 - download files, 2 - update swarm, 3 - finished downloading a file, 4 - finished downloading all files
         MPI_Status status;
 
         MPI_Recv(&tag, 1, MPI_INT, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &status);
@@ -310,6 +371,9 @@ void tracker(int numtasks, int rank) {
 
                     // If the file is found,
                     if (file_index != -1) {
+                        // Sort the swarm by upload number
+                        sort_swarm(file_index, files_list);
+
                         // Add the peer to the swarm
                         files_list[file_index].swarm[files_list[file_index].swarm_size++] = status.MPI_SOURCE;
 
@@ -328,42 +392,40 @@ void tracker(int numtasks, int rank) {
                 break;
             }
             case 2: {  // Peer wants to update the swarm
-                int number_of_wanted_files;
-                MPI_Recv(&number_of_wanted_files, 1, MPI_INT, status.MPI_SOURCE, 2, MPI_COMM_WORLD, &status);
+                char wanted_file[MAX_FILENAME + 1];
+                MPI_Recv(wanted_file, MAX_FILENAME + 1, MPI_CHAR, status.MPI_SOURCE, 2, MPI_COMM_WORLD, &status);
 
-                for (int i = 0; i < number_of_wanted_files; i++) {
-                    char wanted_file[MAX_FILENAME + 1];
-                    MPI_Recv(wanted_file, MAX_FILENAME + 1, MPI_CHAR, status.MPI_SOURCE, 2, MPI_COMM_WORLD, &status);
+                // Search for the file in the files_list
+                int file_index = -1;
+                for (int i = 0; i < files_list_size; i++) {
+                    if (strcmp(files_list[i].f.file_name, wanted_file) == 0) {
+                        file_index = i;
+                        break;
+                    }
+                }
 
-                    // Search for the file in the files_list
-                    int file_index = -1;
-                    for (int j = 0; j < files_list_size; j++) {
-                        if (strcmp(files_list[j].f.file_name, wanted_file) == 0) {
-                            file_index = j;
+                // If the file is found,
+                if (file_index != -1) {
+                    // Sort the swarm by upload number
+                    sort_swarm(file_index, files_list);
+
+                    // Add the peer to the swarm if it's not already there
+                    int found = 0;
+                    for (int i = 0; i < files_list[file_index].swarm_size; i++) {
+                        if (files_list[file_index].swarm[i] == status.MPI_SOURCE) {
+                            found = 1;
                             break;
                         }
                     }
 
-                    // If the file is found,
-                    if (file_index != -1) {
-                        // Add the peer to the swarm if it's not already there
-                        int found = 0;
-                        for (int j = 0; j < files_list[file_index].swarm_size; j++) {
-                            if (files_list[file_index].swarm[j] == status.MPI_SOURCE) {
-                                found = 1;
-                                break;
-                            }
-                        }
+                    if (!found) {
+                        files_list[file_index].swarm[files_list[file_index].swarm_size++] = status.MPI_SOURCE;
+                    }
 
-                        if (!found) {
-                            files_list[file_index].swarm[files_list[file_index].swarm_size++] = status.MPI_SOURCE;
-                        }
-
-                        // Send the swarm and chunks to the peer
-                        MPI_Send(&files_list[file_index].swarm_size, 1, MPI_INT, status.MPI_SOURCE, 2, MPI_COMM_WORLD);
-                        for (int j = 0; j < files_list[file_index].swarm_size; j++) {
-                            MPI_Send(&files_list[file_index].swarm[j], 1, MPI_INT, status.MPI_SOURCE, 2, MPI_COMM_WORLD);
-                        }
+                    // Send the swarm to the peer
+                    MPI_Send(&files_list[file_index].swarm_size, 1, MPI_INT, status.MPI_SOURCE, 2, MPI_COMM_WORLD);
+                    for (int j = 0; j < files_list[file_index].swarm_size; j++) {
+                        MPI_Send(&files_list[file_index].swarm[j], 1, MPI_INT, status.MPI_SOURCE, 2, MPI_COMM_WORLD);
                     }
                 }
                 break;
@@ -447,7 +509,7 @@ void peer(int numtasks, int rank) {
         }
     }
 
-    // Receive ACK
+    // Receive ACK meaning we can start downloading/uploading
     {
         char ack[4];
         MPI_Status status;
@@ -467,7 +529,6 @@ void peer(int numtasks, int rank) {
     download_thread_argument.number_of_owned_files = &number_of_owned_files;
 
     upload_thread_arg upload_thread_argument;
-    upload_thread_argument.rank = &rank;
     upload_thread_argument.stop = &stop;
     upload_thread_argument.owned_files = owned_files;
     upload_thread_argument.number_of_owned_files = &number_of_owned_files;
@@ -484,6 +545,7 @@ void peer(int numtasks, int rank) {
         exit(-1);
     }
 
+    // Wait for the tracker to signal the peers to stop
     MPI_Recv(NULL, 0, MPI_CHAR, TRACKER_RANK, 5, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
     stop = 1;
 
